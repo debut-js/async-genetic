@@ -2,15 +2,20 @@
   "author": "Dmitriy Yurov <narkozzforb@gmail.com>",
   "name": "async-genetic",
   "description": "Implementation of genetic algorithms for nodejs and browser",
-  "version": "1.6.13",
+  "version": "2.0.0",
   "homepage": "https://github.com/BusinessDuck/async-genetic",
   "repository": {
     "type": "git",
     "url": "git://github.com/BusinessDuck/async-genetic"
   },
   "scripts": {
-    "start": "ts-node --",
-    "build": "rollup -c ./rollup.config.js",
+    "build": "vite build",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "bench:classic": "vite-node test/test-classic-single.ts",
+    "bench:island": "vite-node test/test-iland-single.ts",
+    "bench:compare": "vite-node test/comparison.ts",
     "version": "npm run build",
     "postversion": "git push && git push --tags"
   },
@@ -21,26 +26,18 @@
   "module": "lib/index.esm.js",
   "browser": "lib/index.umd.js",
   "types": "lib/index.d.ts",
-  "dependencies": {
-    "object-path-immutable": "^4.1.0"
-  },
   "devDependencies": {
-    "@rollup/plugin-buble": "^0.21.3",
-    "@rollup/plugin-commonjs": "^13.0.0",
-    "@rollup/plugin-node-resolve": "^8.1.0",
+    "@types/node": "^20.19.41",
     "@typescript-eslint/eslint-plugin": "^4.1.0",
     "@typescript-eslint/parser": "^4.1.0",
     "eslint": "^7.8.1",
     "eslint-config-prettier": "^6.11.0",
     "eslint-plugin-prettier": "^3.1.4",
     "prettier": "^2.1.1",
-    "rollup": "^2.18.0",
-    "rollup-plugin-gzip": "^2.2.0",
-    "rollup-plugin-terser": "^5.1.2",
-    "rollup-plugin-typescript2": "^0.27.1",
-    "rollup-plugin-uglify-es": "0.0.1",
-    "ts-node": "^8.10.2",
     "tslib": "^2.0.0",
-    "typescript": "^3.9.5"
+    "typescript": "^5.9.3",
+    "vite": "^5.4.21",
+    "vite-plugin-dts": "^4.5.4",
+    "vitest": "^2.1.9"
   }
 }

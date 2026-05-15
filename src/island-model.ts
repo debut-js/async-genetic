@@ -32,7 +32,15 @@ export class IslandGeneticModel<T> {
     private geneticOptions: GeneticOptions<T>;
 
     /**
-     * Population getter for full compatibility with classic genetic interface
+     * Population view across all islands (or the continent if active).
+     *
+     * Returns:
+     *   - a **live reference** to `continent.population` when the model is
+     *     in continent mode (after `moveAllToContinent`),
+     *   - a **fresh concatenation** of island populations otherwise.
+     *
+     * Do not mutate the returned array — in continent mode mutations would
+     * affect the underlying state. Use it for reading only.
      */
     get population() {
         // If population on continent get from last one
@@ -53,36 +61,52 @@ export class IslandGeneticModel<T> {
     }
 
     /**
-     * Stats compatibility method, aggregate stats from all islands
+     * Aggregated stats across islands.
+     *  - fitnessPopulation: sum (total individuals)
+     *  - maximumFitness:    max across islands
+     *  - minimumFitness:    min across islands
+     *  - averageFitness, fitnessStdDev: weighted average by population size
      */
     get stats() {
-        // If population on continent get from last one
         if (this.continent.population.length) {
             return this.continent.stats;
         }
 
-        let stats = {};
+        let totalPop = 0;
+        let maxFitness = -Infinity;
+        let minFitness = Infinity;
+        let avgAccum = 0;
+        let stdAccum = 0;
 
         for (let i = 0; i < this.options.islandCount; i++) {
-            const island = this.islands[i];
-            const islandStats = island.stats;
+            const s = this.islands[i].stats as Record<string, number>;
+            const popSize = s.fitnessPopulation || 0;
+            totalPop += popSize;
 
-            if (i === 0) {
-                stats = { ...islandStats };
-            } else {
-                for (const key in islandStats) {
-                    stats[key] += islandStats[key];
-                }
+            if (typeof s.maximumFitness === 'number') {
+                maxFitness = Math.max(maxFitness, s.maximumFitness);
+            }
+
+            if (typeof s.minimumFitness === 'number') {
+                minFitness = Math.min(minFitness, s.minimumFitness);
+            }
+
+            if (typeof s.averageFitness === 'number') {
+                avgAccum += s.averageFitness * popSize;
+            }
+
+            if (typeof s.fitnessStdDev === 'number') {
+                stdAccum += s.fitnessStdDev * popSize;
             }
         }
 
-        for (const key in stats) {
-            if (key !== 'population') {
-                stats[key] /= this.options.islandCount;
-            }
-        }
-
-        return stats;
+        return {
+            fitnessPopulation: totalPop,
+            maximumFitness: maxFitness === -Infinity ? 0 : Number(maxFitness.toFixed(4)),
+            minimumFitness: minFitness === Infinity ? 0 : minFitness,
+            averageFitness: totalPop ? Number((avgAccum / totalPop).toFixed(4)) : 0,
+            fitnessStdDev: totalPop ? Number((stdAccum / totalPop).toFixed(4)) : 0,
+        };
     }
 
     constructor(options: Partial<IslandGeneticModelOptions<T>>, geneticOptions: GeneticOptions<T>) {
@@ -100,11 +124,16 @@ export class IslandGeneticModel<T> {
                 return phenotypeA.fitness >= phenotypeB.fitness;
             },
             ...geneticOptions,
-            // Should be more than continent, because environment are special
-            mutateProbablity: options.islandMutationProbability,
-            // Should be more than continent, because area is small
-            crossoverProbablity: options.islandCrossoverProbability,
-            // Reduce population size for each island (sum of all phenotypes should be equal to total population count)
+            // Per-island probabilities — read from merged options, otherwise
+            // `undefined` would leak in when caller skipped these fields and
+            // disable mutation/crossover entirely.
+            mutateProbablity: this.options.islandMutationProbability,
+            crossoverProbablity: this.options.islandCrossoverProbability,
+            // Per-island population size. Note: when `populationSize` does not
+            // divide evenly by `islandCount`, the total across islands will
+            // differ from `populationSize` by up to ±islandCount. For exact
+            // budgets, pick a `populationSize` that's a multiple of
+            // `islandCount`.
             populationSize: Math.round(geneticOptions.populationSize / this.options.islandCount),
         };
 
@@ -146,12 +175,27 @@ export class IslandGeneticModel<T> {
     }
 
     /**
-     * Seed populations
+     * Seed populations. Provided entities are split round-robin between
+     * islands so the initial state across islands is diverse; the rest is
+     * filled by each island's randomFunction.
      */
     public async seed(entities?: T[]) {
+        // Reset continent-side state from any previous run so a fresh seed()
+        // starts cleanly: empty continent population, flag back to islands.
+        this.continent.population = [];
+        this.populationOnContinent = false;
+
+        const buckets: T[][] = [];
         for (let i = 0; i < this.options.islandCount; i++) {
-            const island = this.islands[i];
-            await island.seed(entities);
+            buckets.push([]);
+        }
+        if (entities && entities.length) {
+            for (let i = 0; i < entities.length; i++) {
+                buckets[i % this.options.islandCount].push(entities[i]);
+            }
+        }
+        for (let i = 0; i < this.options.islandCount; i++) {
+            await this.islands[i].seed(buckets[i]);
         }
     }
     /**
@@ -190,25 +234,79 @@ export class IslandGeneticModel<T> {
     }
 
     /**
-     * island migrations alorithm
+     * island migrations algorithm
+     *
+     * Two-phase: first collect what to move (without mutating populations),
+     * then apply all moves. The previous version spliced inside a
+     * `for (j < island.population.length)` loop, which skipped entries and
+     * could deplete an island when migrationFunction always returned 0.
      */
     private migration() {
+        if (this.options.islandCount < 2) {
+            return;
+        }
+
+        // Phase 1: collect migrants per source island without mutating populations.
+        // Each island keeps at least one individual so subsequent breed() has
+        // something to select from even with migrationProbability = 1.
+        const migrants: Array<{ from: number; phenotype: Phenotype<T> }> = [];
+
         for (let i = 0; i < this.options.islandCount; i++) {
             const island = this.islands[i];
+            const popSize = island.population.length;
+            const maxLeaving = Math.max(0, popSize - 1);
+            const taken = new Set<number>();
+            const pickedIndexes: number[] = [];
 
-            for (let j = 0; j < island.population.length; j++) {
-                if (Math.random() <= this.options.migrationProbability) {
-                    const selectedIndex = this.selectOne(island);
-                    const migratedPhonotype = this.peekPhenotye(island, selectedIndex);
-                    const newIsland = this.getRandomIsland(i);
+            // Reset selector state per island so sequence-based selectors
+            // (Fittest, FittestLinear, Sequential, RandomLinearRank) start
+            // from scratch on each island instead of bleeding indexes
+            // from the previous one.
+            this.internalGenState = {};
 
-                    // Move phenotype from old to new island
-                    this.insertPhenotype(newIsland, migratedPhonotype);
+            for (let j = 0; j < popSize && pickedIndexes.length < maxLeaving; j++) {
+                if (Math.random() > this.options.migrationProbability) continue;
+                let selectedIndex = this.selectOne(island);
+                let guard = 0;
+                while (taken.has(selectedIndex) && guard < popSize) {
+                    selectedIndex = this.selectOne(island);
+                    guard++;
                 }
+                if (taken.has(selectedIndex)) continue;
+                taken.add(selectedIndex);
+                pickedIndexes.push(selectedIndex);
+            }
+
+            // Splice in descending order so earlier removals don't shift later indexes.
+            pickedIndexes.sort((a, b) => b - a);
+            for (const idx of pickedIndexes) {
+                const ph = island.population.splice(idx, 1)[0];
+                if (ph) migrants.push({ from: i, phenotype: ph });
             }
         }
 
+        // Phase 2: distribute migrants round-robin to non-source islands so
+        // no destination is starved by random clustering.
+        const cursors: number[] = new Array(this.options.islandCount).fill(0);
+        for (const { from, phenotype } of migrants) {
+            const to = this.pickDestination(from, cursors);
+            this.islands[to].population.push(phenotype);
+        }
+
         this.reorderIslands();
+    }
+
+    /**
+     * Round-robin destination selection that skips the source island.
+     * `cursors[from]` advances per source so destinations are spread evenly.
+     */
+    private pickDestination(from: number, cursors: number[]): number {
+        const n = this.options.islandCount;
+        if (n <= 1) return from;
+        cursors[from] = cursors[from] % (n - 1);
+        const offset = cursors[from]++;
+        const target = (from + 1 + offset) % n;
+        return target;
     }
 
     /**
@@ -282,43 +380,30 @@ export class IslandGeneticModel<T> {
         return migrationFunction.call(this, island.population);
     }
 
-    /**
-     * Returns a random picked island
-     * TODO: Improve island selection by selection function
-     */
-    private getRandomIsland(exclude: number) {
-        const targetIdx = Math.floor(Math.random() * this.options.islandCount);
-
-        if (targetIdx !== exclude) {
-            return this.islands[targetIdx];
-        }
-
-        return this.getRandomIsland(exclude);
-    }
-
-    /**
-     * Peek phenotype from island
-     */
-    private peekPhenotye(island: Genetic<T>, idx: number): Phenotype<T> {
-        return island.population.splice(idx, 1).pop();
-    }
-
-    /**
-     * Insert phenotype to island with custom index
-     */
-    private insertPhenotype(island: Genetic<T>, phenotype: Phenotype<T>): void {
-        island.population.push(phenotype);
-    }
 }
 
-function Fittest<T>(this: IslandGeneticModel<T>): number {
-    return 0;
+/**
+ * Sequentially export the fittest individuals (top-1, top-2, ...) within a
+ * single generation. Populations are kept sorted best-first by
+ * `reorderPopulation`, so successive calls walk down the sorted list.
+ *
+ * The migration loop also dedups indexes per pass, so a constant-0 selector
+ * (the previous implementation) would migrate only 1 individual per gen.
+ */
+function Fittest<T>(this: IslandGeneticModel<T>, pop: Array<Phenotype<T>>): number {
+    const state = this.internalGenState as { fit?: number };
+    let i = state.fit ?? 0;
+    if (i >= pop.length) i = 0;
+    state.fit = i + 1;
+    return i;
 }
 
 function FittestLinear<T>(this: IslandGeneticModel<T>, pop: Array<Phenotype<T>>): number {
-    this.internalGenState['flr'] = this.internalGenState['flr'] >= pop.length ? 0 : this.internalGenState['flr'] || 0;
-
-    return this.internalGenState['flr']++;
+    const state = this.internalGenState as { flr?: number };
+    let i = state.flr ?? 0;
+    if (i >= pop.length) i = 0;
+    state.flr = i + 1;
+    return i;
 }
 
 function FittestRandom<T>(this: IslandGeneticModel<T>, pop: Array<Phenotype<T>>): number {
@@ -330,13 +415,19 @@ function Random<T>(this: IslandGeneticModel<T>, pop: Array<Phenotype<T>>): numbe
 }
 
 function RandomLinearRank<T>(this: IslandGeneticModel<T>, pop: Array<Phenotype<T>>): number {
-    this.internalGenState['rlr'] = this.internalGenState['rlr'] >= pop.length ? 0 : this.internalGenState['rlr'] || 0;
-
-    return Math.floor(Math.random() * Math.min(pop.length, this.internalGenState['rlr']++));
+    // See note on Genetic.RandomLinearRank — growing window 1..pop.length.
+    const state = this.internalGenState as { rlr?: number };
+    let rlr = state.rlr ?? 0;
+    if (rlr >= pop.length) rlr = 0;
+    const window = Math.min(pop.length, rlr + 1);
+    state.rlr = rlr + 1;
+    return Math.floor(Math.random() * window);
 }
 
 function Sequential<T>(this: IslandGeneticModel<T>, pop: Array<Phenotype<T>>): number {
-    this.internalGenState['seq'] = this.internalGenState['seq'] >= pop.length ? 0 : this.internalGenState['seq'] || 0;
-
-    return this.internalGenState['seq']++ % pop.length;
+    const state = this.internalGenState as { seq?: number };
+    let i = state.seq ?? 0;
+    if (i >= pop.length) i = 0;
+    state.seq = i + 1;
+    return i;
 }
